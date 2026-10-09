@@ -1,0 +1,260 @@
+"""
+wave_lab.py
+
+Full interactive demo for generating and viewing synthetic traveling
+waves, with adjustable wave type, frequency, amplitude, direction/source
+location, number of sources, timing/spatial randomness, and noise level.
+
+Shows:
+  - Clean and noisy spatial snapshots, side by side
+  - Time traces for three selectable pixels (clean vs noisy)
+  - A power spectrum (FFT) for one of those pixels, to directly confirm
+    the wave's frequency content and see how noise adds broadband power
+
+Includes two quick presets:
+  - "8Hz preset": matches the whole-cortex disengagement oscillation
+  - "Gamma preset": matches the M2 gamma burst seen during success trials
+    (speed set slower/more local as a plausible guess based on the
+    PV-interneuron hypothesis discussed in the lab's bioRxiv paper --
+    not a measured value)
+
+Run this file directly to launch the demo.
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider, Button, RadioButtons
+
+from wave_sim import make_grid, planar_wave, radial_wave, multi_source_wave
+
+FRATE = 200  # matches make_grid()'s default fs
+
+
+def run_wave_lab():
+    x, y, t = make_grid()
+    n_frames = len(t)
+
+    state = {
+        "wave_type": "Planar",
+        "clean_signal": None,
+        "base_noise": None,
+        "truth": None,
+        "playing": False,
+    }
+
+    fig = plt.figure(figsize=(15, 9))
+
+    # --- top row: spatial snapshots ---
+    ax_clean = fig.add_axes([0.40, 0.62, 0.25, 0.33])
+    im_clean = ax_clean.imshow(np.zeros((50, 50)), cmap='RdBu', vmin=-2, vmax=2)
+    ax_clean.set_title("Clean")
+    ax_clean.axis('off')
+    fig.colorbar(im_clean, ax=ax_clean, fraction=0.046)
+
+    ax_noisy = fig.add_axes([0.70, 0.62, 0.25, 0.33])
+    im_noisy = ax_noisy.imshow(np.zeros((50, 50)), cmap='RdBu', vmin=-2, vmax=2)
+    ax_noisy.set_title("Noisy")
+    ax_noisy.axis('off')
+    fig.colorbar(im_noisy, ax=ax_noisy, fraction=0.046)
+
+    # --- middle row: multi-pixel time trace, and power spectrum ---
+    ax_trace = fig.add_axes([0.40, 0.36, 0.25, 0.22])
+    ax_trace.set_title("Pixel traces over time")
+    ax_trace.set_xlabel("Frame")
+    ax_trace.set_ylabel("Value")
+
+    ax_spectrum = fig.add_axes([0.70, 0.36, 0.25, 0.22])
+    ax_spectrum.set_title("Power spectrum (pixel 2)")
+    ax_spectrum.set_xlabel("Frequency (Hz)")
+    ax_spectrum.set_ylabel("Magnitude")
+
+    # --- left column: controls ---
+    ax_radio = fig.add_axes([0.03, 0.80, 0.30, 0.15])
+    radio = RadioButtons(ax_radio, ("Planar", "Radial", "Multi-source"))
+
+    slider_specs = [
+        ("freq_hz", "Freq (Hz)", 1, 60, 8),
+        ("speed_mm_s", "Speed (mm/s)", 5, 60, 20),
+        ("amplitude", "Amplitude", 0.5, 3.0, 1.0),
+        ("direction_deg", "Direction (Planar)", 0, 360, 45),
+        ("source_x", "Source X (Radial)", 0, 10, 5),
+        ("source_y", "Source Y (Radial)", 0, 10, 5),
+        ("num_sources", "# sources (Multi)", 1, 8, 3),
+        ("time_spread_s", "Time spread (Multi)", 0, 2, 0.5),
+        ("spatial_confinement_mm", "Space spread (Multi)", 0.5, 5, 3),
+    ]
+
+    sliders = {}
+    y0 = 0.76
+    for key, label, vmin, vmax, vinit in slider_specs:
+        ax_s = fig.add_axes([0.03, y0, 0.30, 0.02])
+        sliders[key] = Slider(ax_s, label, vmin, vmax, valinit=vinit)
+        y0 -= 0.038
+
+    # three trace-pixel selectors (diagonal index 0-49, like plot_mean_trace.py)
+    pixel_sliders = {}
+    pixel_defaults = [15, 25, 35]
+    pixel_colors = ['tab:blue', 'tab:green', 'tab:orange']
+    for i, default in enumerate(pixel_defaults):
+        ax_p = fig.add_axes([0.03, y0, 0.30, 0.02])
+        pixel_sliders[i] = Slider(ax_p, f"Trace pixel {i+1}", 0, 49,
+                                   valinit=default, valstep=1)
+        y0 -= 0.038
+
+    ax_regen = fig.add_axes([0.03, y0 - 0.02, 0.30, 0.04])
+    btn_regen = Button(ax_regen, "Regenerate wave")
+
+    ax_preset8 = fig.add_axes([0.03, y0 - 0.08, 0.145, 0.04])
+    btn_preset8 = Button(ax_preset8, "8Hz preset")
+
+    ax_preset_gamma = fig.add_axes([0.185, y0 - 0.08, 0.145, 0.04])
+    btn_preset_gamma = Button(ax_preset_gamma, "Gamma preset")
+
+    # --- bottom: frame/noise sliders, play button, ground truth ---
+    ax_frame = fig.add_axes([0.40, 0.17, 0.55, 0.03])
+    frame_slider = Slider(ax_frame, "Frame", 0, n_frames - 1, valinit=0, valstep=1)
+
+    ax_noise = fig.add_axes([0.40, 0.11, 0.55, 0.03])
+    noise_slider = Slider(ax_noise, "Noise level", 0.0, 2.0, valinit=0.0)
+
+    ax_play = fig.add_axes([0.40, 0.02, 0.12, 0.05])
+    btn_play = Button(ax_play, "Play")
+
+    ax_truth = fig.add_axes([0.56, 0.01, 0.4, 0.07])
+    ax_truth.axis('off')
+    truth_text = ax_truth.text(0, 0.5, "", fontsize=9, va='center', wrap=True)
+
+    def generate(_event=None):
+        wave_type = state["wave_type"]
+        freq_hz = sliders["freq_hz"].val
+        speed_mm_s = sliders["speed_mm_s"].val
+        amplitude = sliders["amplitude"].val
+
+        if wave_type == "Planar":
+            signal, truth = planar_wave(
+                x, y, t, freq_hz=freq_hz, speed_mm_s=speed_mm_s,
+                direction_deg=sliders["direction_deg"].val,
+                amplitude=amplitude
+            )
+        elif wave_type == "Radial":
+            signal, truth = radial_wave(
+                x, y, t, freq_hz=freq_hz, speed_mm_s=speed_mm_s,
+                source_xy=(sliders["source_x"].val, sliders["source_y"].val),
+                amplitude=amplitude, attenuation=0.05
+            )
+        else:  # Multi-source
+            signal, truth = multi_source_wave(
+                x, y, t, freq_hz=freq_hz, speed_mm_s=speed_mm_s,
+                amplitude=amplitude,
+                num_sources=int(sliders["num_sources"].val),
+                time_spread_s=sliders["time_spread_s"].val,
+                spatial_confinement_mm=sliders["spatial_confinement_mm"].val,
+                rng=np.random.default_rng(seed=1)
+            )
+
+        state["clean_signal"] = signal
+        state["truth"] = truth
+        # fixed seed so the noise PATTERN stays stable as the slider moves,
+        # you're scaling the same noise up/down, not re-randomizing it
+        state["base_noise"] = np.random.default_rng(seed=42).normal(0, 1, size=signal.shape)
+
+        truth_text.set_text(f"Ground truth: {truth}")
+        frame_slider.set_val(0)
+        update_display()
+
+    def update_display(_event=None):
+        signal = state["clean_signal"]
+        if signal is None:
+            return
+        frame = int(frame_slider.val)
+        noise_level = noise_slider.val
+
+        clean_frame = signal[:, :, frame]
+        noisy_frame = clean_frame + state["base_noise"][:, :, frame] * noise_level
+
+        im_clean.set_data(clean_frame)
+        im_noisy.set_data(noisy_frame)
+        ax_clean.set_title(f"Clean ({state['wave_type']}, frame {frame})")
+        ax_noisy.set_title(f"Noisy (noise = {noise_level:.2f})")
+
+        # --- multi-pixel time trace ---
+        ax_trace.clear()
+        for i, pslider in pixel_sliders.items():
+            p = int(pslider.val)
+            clean_trace = signal[p, p, :]
+            noisy_trace = clean_trace + state["base_noise"][p, p, :] * noise_level
+            ax_trace.plot(clean_trace, color=pixel_colors[i], linewidth=1.3,
+                          label=f"pixel {p} clean")
+            ax_trace.plot(noisy_trace, color=pixel_colors[i], linewidth=0.8,
+                          alpha=0.4, label=f"pixel {p} noisy")
+        ax_trace.axvline(frame, color='black', linestyle='--', linewidth=1)
+        ax_trace.set_title("Pixel traces over time")
+        ax_trace.set_xlabel("Frame")
+        ax_trace.legend(loc='upper right', fontsize=6, ncol=1)
+
+        # --- power spectrum, for the middle trace pixel (pixel 2) ---
+        mid_p = int(pixel_sliders[1].val)
+        clean_trace_mid = signal[mid_p, mid_p, :]
+        noisy_trace_mid = clean_trace_mid + state["base_noise"][mid_p, mid_p, :] * noise_level
+
+        freqs = np.fft.rfftfreq(len(clean_trace_mid), d=1 / FRATE)
+        clean_fft = np.abs(np.fft.rfft(clean_trace_mid))
+        noisy_fft = np.abs(np.fft.rfft(noisy_trace_mid))
+
+        ax_spectrum.clear()
+        ax_spectrum.plot(freqs, clean_fft, color='tab:blue', label='clean', linewidth=1.3)
+        ax_spectrum.plot(freqs, noisy_fft, color='tab:red', alpha=0.6, label='noisy', linewidth=1)
+        ax_spectrum.axvline(sliders["freq_hz"].val, color='black', linestyle='--',
+                             linewidth=1, label='set freq')
+        ax_spectrum.set_xlim(0, 80)
+        ax_spectrum.set_title(f"Power spectrum (pixel {mid_p})")
+        ax_spectrum.set_xlabel("Frequency (Hz)")
+        ax_spectrum.set_ylabel("Magnitude")
+        ax_spectrum.legend(loc='upper right', fontsize=7)
+
+        fig.canvas.draw_idle()
+
+    def on_radio(label):
+        state["wave_type"] = label
+        generate()
+
+    def on_play(_event):
+        state["playing"] = not state["playing"]
+        btn_play.label.set_text("Pause" if state["playing"] else "Play")
+
+    def advance():
+        if state["playing"] and state["clean_signal"] is not None:
+            nxt = frame_slider.val + 1
+            if nxt > n_frames - 1:
+                nxt = 0
+            frame_slider.set_val(nxt)
+
+    def set_preset_8hz(_event=None):
+        sliders["freq_hz"].set_val(8)
+        sliders["speed_mm_s"].set_val(20)
+        generate()
+
+    def set_preset_gamma(_event=None):
+        sliders["freq_hz"].set_val(55)
+        sliders["speed_mm_s"].set_val(5)  # gamma likely travels slower/more locally
+        generate()
+
+    radio.on_clicked(on_radio)
+    btn_regen.on_clicked(generate)
+    btn_preset8.on_clicked(set_preset_8hz)
+    btn_preset_gamma.on_clicked(set_preset_gamma)
+    frame_slider.on_changed(update_display)
+    noise_slider.on_changed(update_display)
+    for pslider in pixel_sliders.values():
+        pslider.on_changed(update_display)
+    btn_play.on_clicked(on_play)
+
+    timer = fig.canvas.new_timer(interval=1000 // 30)
+    timer.add_callback(advance)
+    timer.start()
+
+    generate()  # build the initial wave on launch
+    plt.show()
+
+
+if __name__ == "__main__":
+    run_wave_lab()

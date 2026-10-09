@@ -1,5 +1,6 @@
 '''
 from matlab_ports.plot_mean_trace import plot_mean_trace
+from matlab_ports.play_data_trial import play_data_trial
 
 plot_mean_trace(
     'EMXJ21_0406',

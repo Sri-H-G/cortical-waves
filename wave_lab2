@@ -1,0 +1,192 @@
+"""
+wave_lab2.py
+Simulator GUI with only the parameters Dieter asked for.
+
+Regenerate-type controls (frequency, speed, amplitude, direction, SNR, wave
+type, mask) only take effect when generation runs (~0.5 s). Frame, trace
+pixel and zoom are instant: they just re-read the computed arrays.
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider, Button, RadioButtons, CheckButtons
+
+from wave_sim import make_block, make_mask, FS, PIXEL_MM
+
+PLAY_STEP = 2      # frames per timer tick
+PLAY_MS = 50       # timer interval
+
+
+def run_wave_lab():
+    S = {"data": None, "clean": None, "truth": None, "mask": make_mask(),
+         "playing": False, "busy": False, "drawing": False}
+
+    fig = plt.figure(figsize=(15, 8))
+    RCOL, RWIDTH = 0.46, 0.50
+
+    ax_clean = fig.add_axes([RCOL, 0.58, 0.24, 0.37])
+    im_clean = ax_clean.imshow(np.zeros((50, 50)), cmap="RdBu", vmin=-2, vmax=2)
+    ax_clean.set_title("Signal only (no noise)")
+    ax_clean.axis("off")
+    fig.colorbar(im_clean, ax=ax_clean, fraction=0.046)
+
+    ax_noisy = fig.add_axes([RCOL + 0.27, 0.58, 0.24, 0.37])
+    im_noisy = ax_noisy.imshow(np.zeros((50, 50)), cmap="RdBu", vmin=-2, vmax=2)
+    ax_noisy.set_title("Signal + noise (what gets saved)")
+    ax_noisy.axis("off")
+    fig.colorbar(im_noisy, ax=ax_noisy, fraction=0.046)
+
+    ax_trace = fig.add_axes([RCOL, 0.33, RWIDTH, 0.20])
+    ax_trace.set_title("Pixel trace over time")
+    ax_trace.set_xlabel("Frame")
+    ax_trace.tick_params(axis="y", pad=2)
+    trace_line, = ax_trace.plot([], [], color="tab:blue", linewidth=1.3)
+    trace_vline = ax_trace.axvline(0, color="black", linestyle="--", linewidth=1)
+
+    LEFT, WIDTH = 0.17, 0.20
+
+    ax_radio = fig.add_axes([LEFT, 0.80, WIDTH, 0.14])
+    radio = RadioButtons(ax_radio, ("Planar", "Radial", "Synchronous"))
+
+    slider_specs = [
+        ("freq_hz", "Frequency (Hz)", 1, 60, 8),
+        ("speed_mm_s", "Speed (mm/s)", 1, 60, 20),
+        ("amplitude", "Amplitude", 0.5, 3.0, 1.0),
+        ("direction_deg", "Direction (Planar)", 0, 360, 45),
+        ("snr", "SNR (sig/noise)", 0.1, 5.0, 1.0),
+    ]
+    sliders = {}
+    y0 = 0.75
+    for key, label, vmin, vmax, vinit in slider_specs:
+        ax_s = fig.add_axes([LEFT, y0, WIDTH, 0.025])
+        sliders[key] = Slider(ax_s, label, vmin, vmax, valinit=vinit)
+        y0 -= 0.045
+
+    ax_mask = fig.add_axes([LEFT, 0.505, WIDTH, 0.035])
+    chk_mask = CheckButtons(ax_mask, ["Use mask"], [True])
+
+    ax_regen = fig.add_axes([LEFT, 0.445, WIDTH, 0.05])
+    btn_regen = Button(ax_regen, "Regenerate")
+
+    ax_status = fig.add_axes([LEFT, 0.395, WIDTH, 0.04])
+    ax_status.axis("off")
+    status_text = ax_status.text(0, 0.5, "", fontsize=8, va="center", wrap=True)
+
+    ax_pixel = fig.add_axes([RCOL, 0.23, RWIDTH, 0.025])
+    pixel_slider = Slider(ax_pixel, "Trace pixel (x)", 0, 49, valinit=25, valstep=1)
+
+    ax_zoom = fig.add_axes([RCOL, 0.18, RWIDTH, 0.025])
+    zoom_slider = Slider(ax_zoom, "Trace zoom (s)", 0.1, 10.24, valinit=1.0)
+
+    ax_frame = fig.add_axes([RCOL, 0.10, RWIDTH, 0.025])
+    frame_slider = Slider(ax_frame, "Frame", 0, 2047, valinit=600, valstep=1)
+
+    ax_play = fig.add_axes([RCOL, 0.02, 0.12, 0.05])
+    btn_play = Button(ax_play, "Play")
+
+    ax_truth = fig.add_axes([RCOL + 0.16, 0.01, RWIDTH - 0.14, 0.07])
+    ax_truth.axis("off")
+    truth_text = ax_truth.text(0, 0.5, "", fontsize=8, va="center", wrap=True)
+
+    wave_type_map = {"Planar": "planar", "Radial": "radial",
+                     "Synchronous": "synchronous"}
+
+    def set_frame_silently(val):
+        frame_slider.eventson = False
+        frame_slider.set_val(val)
+        frame_slider.eventson = True
+
+    def update_display(_=None):
+        if S["data"] is None or S["drawing"]:
+            return
+        S["drawing"] = True
+        try:
+            data, clean = S["data"], S["clean"]
+            frame = int(frame_slider.val)
+            p = int(pixel_slider.val)
+            im_clean.set_data(clean[:, :, frame])
+            im_noisy.set_data(data[:, :, frame])
+
+            zoom_frames = max(10, int(zoom_slider.val * FS))
+            lo = max(0, frame - zoom_frames // 2)
+            hi = min(data.shape[2], lo + zoom_frames)
+            lo = max(0, hi - zoom_frames)
+            xs = np.arange(lo, hi)
+            trace_line.set_data(xs, data[25, p, lo:hi])
+            trace_vline.set_xdata([frame, frame])
+            ax_trace.set_xlim(lo, hi)
+            seg = data[25, p, lo:hi]
+            pad = 0.1 * (seg.max() - seg.min() + 1e-9)
+            ax_trace.set_ylim(seg.min() - pad, seg.max() + pad)
+            ax_trace.set_title(f"Pixel trace (x={p}, y=25), zoom={zoom_slider.val:.2f}s")
+            fig.canvas.draw_idle()
+        finally:
+            S["drawing"] = False
+
+    def generate(_=None):
+        if S["busy"]:
+            return
+        S["busy"] = True
+        S["playing"] = False
+        btn_play.label.set_text("Play")
+        status_text.set_text("Generating... (about 1 s)")
+        fig.canvas.draw_idle()
+        plt.pause(0.001)          # force the status text to show
+        try:
+            wtype = wave_type_map[radio.value_selected]
+            mask = S["mask"] if chk_mask.get_status()[0] else np.ones((50, 50), bool)
+            kwargs = dict(wave_type=wtype,
+                          freq_hz=sliders["freq_hz"].val,
+                          speed_mm_s=sliders["speed_mm_s"].val,
+                          direction_deg=sliders["direction_deg"].val,
+                          scale=sliders["amplitude"].val,
+                          mask=mask, seed=0)
+            data, truth = make_block(snr=sliders["snr"].val, **kwargs)
+            clean, _t = make_block(snr=1e6, **kwargs)
+            S["data"], S["clean"], S["truth"] = data, clean, truth
+
+            status_text.set_text("\n".join(truth["warnings"]) if truth["warnings"] else "Ready.")
+            truth_text.set_text(f"Ground truth: {truth}")
+
+            mid = int((truth["burst_start_s"] + truth["burst_dur_s"] / 2) * FS)
+            set_frame_silently(max(0, min(2047, mid)))
+            update_display()
+        except Exception as e:
+            status_text.set_text(f"ERROR: {e}")
+            fig.canvas.draw_idle()
+        finally:
+            S["busy"] = False
+
+    def on_play(_):
+        S["playing"] = not S["playing"]
+        btn_play.label.set_text("Pause" if S["playing"] else "Play")
+
+    def advance():
+        if (not S["playing"] or S["data"] is None
+                or S["busy"] or S["drawing"]):
+            return
+        nxt = int(frame_slider.val) + PLAY_STEP
+        if nxt > 2047:
+            nxt = 0
+        set_frame_silently(nxt)
+        update_display()
+
+    radio.on_clicked(lambda _l: generate())
+    btn_regen.on_clicked(generate)
+    chk_mask.on_clicked(lambda _l: generate())
+    frame_slider.on_changed(update_display)
+    pixel_slider.on_changed(update_display)
+    zoom_slider.on_changed(update_display)
+    btn_play.on_clicked(on_play)
+
+    timer = fig.canvas.new_timer(interval=PLAY_MS)
+    timer.add_callback(advance)
+    timer.start()
+    fig._wave_lab_timer = timer     # keep a reference or it gets garbage collected
+
+    generate()
+    return fig
+
+
+if __name__ == "__main__":
+    run_wave_lab()
+    plt.show()
