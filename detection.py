@@ -22,8 +22,14 @@ in a global mean -- PGD reads near zero even for a perfect, high-SNR
 radial wave. Radial waves need estimate_radial_source() instead, and
 frequency estimation needs estimate_frequency() (power-spectrum based,
 works for every wave type) rather than scanning PGD.
+
+REAL DATA: load_true_mask() loads Dieter's cortex-mask PNG (417x417,
+white = valid cortex), shrinks it to 50x50, and automatically fixes its
+orientation by matching it to where the data actually varies.
 """
 import numpy as np
+from PIL import Image
+from scipy import ndimage
 from scipy.signal import butter, filtfilt, hilbert
 from scipy.ndimage import binary_erosion
 
@@ -268,6 +274,47 @@ def shuffle_pixels(data, mask, seed=0):
     return shuffled
 
 
+# ---------------------------------------------------------------- real masks
+def _variance_mask(data, keep_fraction=0.56):
+    """Rough mask from where the data varies. Used only to find the
+    orientation of the true mask."""
+    s = np.nan_to_num(data).std(axis=2)
+    m = s > np.percentile(s, 100 * (1 - keep_fraction))
+    m = ndimage.binary_fill_holes(m)
+    lab, n = ndimage.label(m)
+    if n > 1:
+        sizes = ndimage.sum(m, lab, range(1, n + 1))
+        m = lab == (1 + int(np.argmax(sizes)))
+    return m
+
+
+def load_true_mask(png_path, data=None, verbose=True):
+    """Load Dieter's cortex mask (417x417 PNG, white = valid cortex) and
+    shrink it to 50x50. If data (Y, X, T) is given, try all 8 rotations and
+    flips and keep the one that best overlaps the data's variance map."""
+    img = Image.open(png_path).convert("L")
+    m = np.array(img.resize((50, 50), Image.BILINEAR)) > 127
+    if data is None:
+        return m
+
+    ref = _variance_mask(data)
+    best, best_iou, best_name = m, -1.0, "as is"
+    for flip in (False, True):
+        base = np.flipud(m) if flip else m
+        for k in range(4):
+            cand = np.rot90(base, k)
+            iou = (cand & ref).sum() / max(1, (cand | ref).sum())
+            if iou > best_iou:
+                best, best_iou = cand, iou
+                best_name = f"{'flipped, ' if flip else ''}rotated {90 * k} deg"
+    if verbose:
+        print(f"true mask: {int(best.sum())} pixels, orientation: {best_name}, "
+              f"overlap with data variance map (IoU) = {best_iou:.2f}")
+        if best_iou < 0.5:
+            print("  WARNING: low overlap. Check that this mask belongs to this animal.")
+    return np.ascontiguousarray(best)
+
+
 if __name__ == "__main__":
     from wave_sim import make_block, make_mask, FS, PIXEL_MM
 
@@ -341,5 +388,3 @@ if __name__ == "__main__":
           f"PGD={real_result['mean_pgd']:.3f}")
     shuffled = shuffle_pixels(data6, mask, seed=1)
     shuffled_result = detect_in_burst_window(shuffled, truth6, 8, FS, PIXEL_MM, mask)
-    print(f"  Shuffled data: direction={shuffled_result['direction_deg']}, "
-          f"PGD={shuffled_result['mean_pgd']:.3f}")

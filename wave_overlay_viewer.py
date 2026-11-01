@@ -1,9 +1,13 @@
 """
 wave_overlay_viewer.py
 Overlay of detection.py's own output on the simulated movie.
-All heavy computation happens ONCE on Regenerate. Frame changes only index
-precomputed arrays, so Play stays smooth.
+Heavy computation happens ONCE on Regenerate; frame changes only index arrays.
+
+Each Regenerate makes a NEW random noise pattern (the seed goes up by one),
+so pressing it with the same settings still gives a fresh example.
+Picking Planar / Radial / Synchronous regenerates straight away.
 """
+import traceback
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button, RadioButtons
@@ -13,14 +17,14 @@ from detection import (get_phase, phase_gradient_detect, erode_mask,
                        estimate_radial_source, estimate_frequency)
 
 FREQ = 8.0
-PLAY_STEP = 2          # frames advanced per timer tick
-PLAY_MS = 50           # timer interval
+PLAY_STEP = 2
+PLAY_MS = 50
 
 
 def run_viewer():
     S = dict(data=None, phase=None, pgd=None, dirs=None, speeds=None,
              truth=None, src=None, freq=None, contour=None, arrow=None,
-             playing=False, busy=False, drawing=False)
+             playing=False, busy=False, drawing=False, seed=-1, nframes=2048)
     mask = make_mask()
     emask = erode_mask(mask, 1)
 
@@ -34,6 +38,15 @@ def run_viewer():
 
     ax_radio = fig.add_axes([0.03, 0.72, 0.20, 0.15])
     radio = RadioButtons(ax_radio, ("Planar", "Radial", "Synchronous"))
+
+    def highlight(_label=None):
+        for lbl in radio.labels:
+            sel = lbl.get_text() == radio.value_selected
+            lbl.set_fontweight("bold" if sel else "normal")
+            lbl.set_color("tab:blue" if sel else "black")
+        fig.canvas.draw_idle()
+    highlight()
+
     ax_snr = fig.add_axes([0.06, 0.62, 0.17, 0.03])
     snr_sl = Slider(ax_snr, "SNR", 0.3, 5.0, valinit=2.0)
     ax_reg = fig.add_axes([0.03, 0.53, 0.20, 0.05])
@@ -62,7 +75,7 @@ def run_viewer():
             return
         S["drawing"] = True
         try:
-            frame = int(frame)
+            frame = int(min(max(frame, 0), S["nframes"] - 1))
             im.set_data(S["data"][:, :, frame])
             clear_overlay()
             ph = S["phase"][:, :, frame]
@@ -79,7 +92,7 @@ def run_viewer():
                 dx, dy = 10 * np.cos(np.deg2rad(d)), 10 * np.sin(np.deg2rad(d))
                 S["arrow"] = ax.annotate("", xy=(x0 + dx, y0 + dy), xytext=(x0, y0),
                                          arrowprops=dict(arrowstyle="-|>", color="lime", lw=3))
-                lines += [f"LIVE DETECTION", f"direction: {d:.1f} deg",
+                lines += ["LIVE DETECTION", f"direction: {d:.1f} deg",
                           f"speed: {sp:.1f} mm/s"]
                 stat.set_color("black")
             else:
@@ -99,14 +112,19 @@ def run_viewer():
         S["busy"] = True
         S["playing"] = False
         btn_play.label.set_text("Play")
+        S["seed"] += 1
         stat.set_text("Computing...\n(a few seconds)")
         stat.set_color("black")
-        fig.canvas.draw_idle(); plt.pause(0.001)
+        fig.canvas.draw(); fig.canvas.flush_events()
         try:
             wt = radio.value_selected.lower()
-            data, truth = make_block(wave_type=wt, freq_hz=FREQ, speed_mm_s=20.0,
-                                     direction_deg=45.0, source_xy=(2.0, 7.0),
-                                     snr=snr_sl.val, mask=mask, seed=0)
+            # each wave type only gets its own settings (same as detection.py's tests)
+            kwargs = dict(freq_hz=FREQ, snr=float(snr_sl.val), mask=mask, seed=S["seed"])
+            if wt == "planar":
+                kwargs.update(speed_mm_s=20.0, direction_deg=45.0)
+            elif wt == "radial":
+                kwargs.update(speed_mm_s=20.0, source_xy=(2.0, 7.0))
+            data, truth = make_block(wt, **kwargs)
             ph = get_phase(data, FREQ, FS).astype(float)
             ph[~emask, :] = np.nan
             pgd, dirs, speeds = phase_gradient_detect(data, FREQ, FS, PIXEL_MM, emask)
@@ -121,7 +139,10 @@ def run_viewer():
                     src = None
             freq, _, _ = estimate_frequency(data, FS, mask=emask, frame_range=(a, b))
             S.update(data=data, phase=ph, pgd=np.asarray(pgd), dirs=np.asarray(dirs),
-                     speeds=np.asarray(speeds), truth=truth, src=src, freq=freq)
+                     speeds=np.asarray(speeds), truth=truth, src=src, freq=freq,
+                     nframes=data.shape[2])
+            fr_sl.valmax = data.shape[2] - 1
+            fr_sl.ax.set_xlim(0, data.shape[2] - 1)
             if wt == "radial":
                 true_pt.set_data([truth["source_xy"][0] / PIXEL_MM],
                                  [truth["source_xy"][1] / PIXEL_MM])
@@ -131,12 +152,13 @@ def run_viewer():
                     est_pt.set_data([], [])
             else:
                 true_pt.set_data([], []); est_pt.set_data([], [])
-            title.set_text(f"{wt} wave, SNR {snr_sl.val:.1f}")
+            title.set_text(f"{wt} wave, SNR {snr_sl.val:.1f}  (example {S['seed'] + 1})")
             mid = (a + b) // 2
             fr_sl.eventson = False; fr_sl.set_val(mid); fr_sl.eventson = True
             draw(mid)
         except Exception as e:
-            stat.set_text(f"ERROR: {e}"); stat.set_color("red")
+            traceback.print_exc()          # full error in the terminal
+            stat.set_text(f"ERROR: {e}\n(see terminal)"); stat.set_color("red")
             fig.canvas.draw_idle()
         finally:
             S["busy"] = False
@@ -149,20 +171,28 @@ def run_viewer():
         if not S["playing"] or S["data"] is None or S["busy"] or S["drawing"]:
             return
         nxt = int(fr_sl.val) + PLAY_STEP
-        if nxt > 2047:
+        if nxt > S["nframes"] - 1:
             nxt = 0
         fr_sl.eventson = False; fr_sl.set_val(nxt); fr_sl.eventson = True
         draw(nxt)
 
     fr_sl.on_changed(lambda v: draw(v))
     btn_reg.on_clicked(regenerate)
-    radio.on_clicked(lambda _l: regenerate())
+    def on_type(_label):
+        highlight()
+        regenerate()
+    radio.on_clicked(on_type)
     btn_play.on_clicked(on_play)
+
+    # Keep every widget alive. Matplotlib only holds weak references to a
+    # widget's click handlers, so a widget nothing else refers to gets deleted
+    # by Python and silently stops responding (this is what broke Regenerate).
+    fig._widgets = [radio, snr_sl, btn_reg, btn_play, fr_sl]
 
     timer = fig.canvas.new_timer(interval=PLAY_MS)
     timer.add_callback(tick)
     timer.start()
-    fig._timer = timer          # keep a reference or it gets garbage collected
+    fig._timer = timer
 
     regenerate()
     return fig
